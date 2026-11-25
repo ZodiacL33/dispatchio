@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Dispatchio",
+  "version": "3.0.0",
+  "description": "Dispatchio: your truck dispatching call list and Google Voice dialer, side by side.",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "unlimitedStorage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://voice.google.com/*",
+    "https://mobile.fmcsa.dot.gov/*",
+    "https://api.groq.com/*",
+    "https://openrouter.ai/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "Dispatchio",
+    "default_icon": {
+      "16": "assets/icon16.png",
+      "32": "assets/icon32.png",
+      "48": "assets/icon48.png",
+      "128": "assets/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://voice.google.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "assets/icon16.png",
+    "32": "assets/icon32.png",
+    "48": "assets/icon48.png",
+    "128": "assets/icon128.png"
+  }
+}

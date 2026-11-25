@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dispatchio</title>
+<link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- 1. Brand header and connection status -->
+  <header class="top">
+    <div class="brand">
+      <img src="assets/dispatchio-symbol.svg" alt="" class="brand-symbol">
+      <img src="assets/dispatchio-wordmark.svg" alt="Dispatchio" class="brand-word">
+    </div>
+    <div class="top-actions">
+      <button id="btnStats" class="icon-btn" aria-label="Open statistics" title="Statistics" data-icon="chart-no-axes-column"></button>
+      <button id="btnSettings" class="icon-btn" aria-label="Open settings" title="Settings" data-icon="settings"></button>
+    </div>
+  </header>
+
+  <div class="statusbar">
+    <button id="gv" class="conn" aria-describedby="diagCard" title="Check the Google Voice connection">
+      <span class="dot" id="gvDot"></span><span id="gvText">Checking Google Voice</span><span data-icon="chevron-down" data-size="14"></span>
+    </button>
+    <div class="kpis">
+      <div class="kpi"><span data-icon="phone" data-size="15"></span><div><small>Today</small><b id="kToday">0 calls</b></div></div>
+      <div class="kpi"><span data-icon="calendar" data-size="15"></span><div><small>Follow-ups</small><b id="kDue">0 due</b></div></div>
+    </div>
+  </div>
+
+  <section id="diagCard" class="card diag" hidden>
+    <div class="row between"><b>Connection check</b><button id="diagClose" class="icon-btn sm" aria-label="Close" data-icon="x" data-size="14"></button></div>
+    <textarea id="diag" rows="8" readonly aria-label="Connection details"></textarea>
+    <div class="row"><button id="diagRun" class="btn sm" data-icon="refresh-cw" data-size="14"> Check again</button><button id="diagCopy" class="btn sm" data-icon="copy" data-size="14"> Copy</button></div>
+  </section>
+
+  <div id="banner" class="banner" role="status" aria-live="polite" hidden>
+    <span id="bannerIcon" data-icon="info" data-size="16"></span>
+    <span id="bannerText"></span>
+    <button id="bannerClose" class="icon-btn sm" aria-label="Dismiss message" data-icon="x" data-size="14"></button>
+  </div>
+
+  <!-- 2. Queue progress and fleet filters -->
+  <section id="queueCard" class="card">
+    <div class="row between">
+      <div class="title"><span data-icon="list-checks"></span><span id="qTitle">Queue</span></div>
+      <button id="fleetChip" class="chip-select" aria-expanded="false" aria-controls="queueControls"><span id="fleetText">0–30 trucks</span><span data-icon="chevron-down" data-size="14"></span></button>
+    </div>
+    <div id="qBlock" class="blockline"><span id="blockText"></span><span id="passText" class="muted"></span></div>
+    <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="prog"><i id="progFill"></i></div>
+    <div class="row between small muted"><span id="leftText"></span><b id="pctText"></b></div>
+
+    <div id="queueControls" hidden>
+      <div class="presets" role="group" aria-label="Fleet size presets">
+        <button class="pill" data-min="0" data-max="9999">Any</button>
+        <button class="pill" data-min="0" data-max="10">0–10</button>
+        <button class="pill" data-min="0" data-max="30">0–30</button>
+        <button class="pill" data-min="11" data-max="30">11–30</button>
+        <button class="pill" data-min="31" data-max="50">31–50</button>
+      </div>
+      <div class="grid2">
+        <div class="field"><label for="minFleet">Min trucks</label>
+          <div class="stepper"><button type="button" data-step="minFleet" data-d="-1" aria-label="Decrease min trucks" data-icon="minus" data-size="14"></button><input id="minFleet" type="number" min="0" inputmode="numeric"><button type="button" data-step="minFleet" data-d="1" aria-label="Increase min trucks" data-icon="plus" data-size="14"></button></div></div>
+        <div class="field"><label for="maxFleet">Max trucks</label>
+          <div class="stepper"><button type="button" data-step="maxFleet" data-d="-1" aria-label="Decrease max trucks" data-icon="minus" data-size="14"></button><input id="maxFleet" type="number" min="0" inputmode="numeric"><button type="button" data-step="maxFleet" data-d="1" aria-label="Increase max trucks" data-icon="plus" data-size="14"></button></div></div>
+      </div>
+      <div class="field"><label for="jumpMc">Jump to MC</label>
+        <div class="inline"><input id="jumpMc" type="number" min="1" inputmode="numeric" placeholder="e.g. 1300000"><button id="jump" class="btn dark">Go</button></div>
+        <small class="muted">Carriers you already called are not blocked. Jumping back into a block you already worked starts a new pass.</small></div>
+    </div>
+  </section>
+
+  <section id="emptyCard" class="card empty" hidden>
+    <span data-icon="database" data-size="22"></span>
+    <h2>No call list loaded</h2>
+    <p>Run <code>build_queue.py</code>, then load the <code>queue.json</code> it creates.</p>
+    <label class="btn primary">Load queue.json<input id="file" type="file" accept=".json" hidden></label>
+  </section>
+
+  <!-- 3. Current carrier -->
+  <section id="carrier" class="card carrier" hidden>
+    <div class="row between">
+      <div class="eyebrow"><span data-icon="building-2" data-size="15"></span>Current carrier</div>
+      <span id="verChip" class="chip" title=""><span data-icon="shield-check" data-size="13"></span><span id="verText">Census data</span></span>
+    </div>
+    <h1 id="name"></h1>
+    <p id="ids" class="ids"></p>
+    <p id="manualTag" class="tag" hidden>Manual call. Not counted in block stats.</p>
+    <hr>
+    <div class="phoneRow">
+      <span class="roundic" data-icon="phone" data-size="16"></span>
+      <div><small>Phone number</small><div id="phone" class="phone"></div></div>
+      <button id="copyPhone" class="icon-btn" aria-label="Copy phone number" title="Copy phone number" data-icon="copy"></button>
+    </div>
+    <div class="tiles">
+      <div class="tile"><span data-icon="truck" data-size="20"></span><div><small>Fleet size</small><b id="fleet"></b></div></div>
+      <div class="tile"><span data-icon="user" data-size="20"></span><div><small>Drivers</small><b id="drivers"></b></div></div>
+    </div>
+    <dl class="facts">
+      <dt><span data-icon="user" data-size="14"></span>Owner</dt><dd id="owner"></dd>
+      <dt><span data-icon="map-pin" data-size="14"></span>Location</dt><dd id="loc"></dd>
+      <dt><span data-icon="mail" data-size="14"></span>Email</dt><dd id="email"></dd>
+    </dl>
+    <button id="moreToggle" class="linkbtn" aria-expanded="false" aria-controls="moreBox"><span data-icon="chevron-down" data-size="14"></span><span id="moreText">Show more details</span></button>
+    <div id="moreBox" hidden>
+      <dl id="more" class="facts"></dl>
+      <a id="safer" class="linkbtn" target="_blank" rel="noopener"><span data-icon="external-link" data-size="14"></span>Open SAFER snapshot (inspections, crashes, live authority)</a>
+    </div>
+  </section>
+
+  <!-- 4. Contextual assistance -->
+  <section id="assist" class="assist" hidden aria-label="Dispatchio Assist">
+    <div class="assist-head">
+      <span data-icon="sparkles" data-size="15"></span><b>Dispatchio Assist</b>
+      <span id="assistSrc" class="muted small"></span>
+      <button id="assistGen" class="icon-btn sm" aria-label="Generate brief" title="Generate brief" data-icon="refresh-cw" data-size="14" hidden></button>
+    </div>
+    <ul id="assistFacts"></ul>
+    <p id="assistAI" class="assist-ai"></p>
+    <p id="assistAI2" class="assist-ai"></p>
+    <div id="assistNoteRow" class="row" hidden>
+      <button id="assistNote" class="btn sm" data-icon="notebook-pen" data-size="14"> Summarize my note</button>
+      <button id="assistUse" class="btn sm" data-icon="check" data-size="14" hidden> Add to note</button>
+    </div>
+  </section>
+
+  <!-- 5. Primary action -->
+  <div id="actions" hidden>
+    <button id="dial" class="btn-dial"><span data-icon="phone" data-size="20"></span><span id="dialText">Dial carrier</span></button>
+    <p id="dialHint" class="hint" aria-live="polite"></p>
+    <div class="grid3">
+      <button id="skip" class="btn" data-icon="skip-forward"><span id="skipText"> Skip</span></button>
+      <button id="pause" class="btn" data-icon="pause"><span id="pauseText"> Pause</span></button>
+      <button id="copy" class="btn" data-icon="copy"> Copy info</button>
+    </div>
+    <label class="switch-row"><span>Dial the next carrier automatically after I hang up</span>
+      <span class="switch"><input id="autoDial" type="checkbox"><i></i></span></label>
+    <p id="autoNote" class="small muted" hidden></p>
+
+    <!-- 6. Call outcomes -->
+    <h3 class="sect">Call outcome</h3>
+    <div class="outcomes" id="outcomes">
+      <button data-o="interested" class="oc"><span data-icon="thumbs-up" data-size="18"></span>Interested</button>
+      <button data-o="callback" class="oc"><span data-icon="calendar-clock" data-size="18"></span>Call back</button>
+      <button data-o="noanswer" class="oc"><span data-icon="phone-off" data-size="18"></span>No answer</button>
+      <button data-o="notinterested" class="oc"><span data-icon="circle-x" data-size="18"></span>Not interested</button>
+      <button data-o="dnc" class="oc danger"><span data-icon="ban" data-size="18"></span>Do not call</button>
+    </div>
+
+    <!-- 7. Notes and lead management -->
+    <div class="field"><div class="row between"><label for="note" class="sect">Add notes</label><small id="noteCount" class="muted">0 / 500</small></div>
+      <textarea id="note" rows="3" maxlength="500" placeholder="Anything worth remembering (optional)"></textarea></div>
+    <h3 class="sect">Save as <small class="muted">(optional)</small></h3>
+    <div class="grid3" id="saveAs">
+      <button data-t="lead" class="btn" data-icon="bookmark"> Lead</button>
+      <button data-t="sale" class="btn" data-icon="handshake"> Sale</button>
+      <button data-t="followup" class="btn" data-icon="calendar-clock"> Follow-up</button>
+    </div>
+    <div class="field"><label for="followDate">Follow-up date (optional)</label><input id="followDate" type="date"></div>
+    <p id="savedTag" class="tag" hidden></p>
+    <button id="unsave" class="btn sm danger-text" data-icon="trash-2" data-size="14" hidden> Remove from saved</button>
+  </div>
+
+  <!-- 8. Collapsible areas -->
+  <details id="savedBox" class="acc">
+    <summary><span data-icon="bookmark" data-size="16"></span><b>Saved carriers</b><em id="savedCount">0</em><span class="chev" data-icon="chevron-down" data-size="16"></span></summary>
+    <div class="acc-body">
+      <div class="tabs" role="tablist" id="savedTabs">
+        <button role="tab" data-f="lead" aria-selected="true">Leads <i></i></button>
+        <button role="tab" data-f="sale" aria-selected="false">Sales <i></i></button>
+        <button role="tab" data-f="followup" aria-selected="false">Follow-ups <i></i></button>
+        <button role="tab" data-f="dnc" aria-selected="false">DNC <i></i></button>
+      </div>
+      <ul id="savedList" class="list"></ul>
+      <div class="row"><button id="exportSaved" class="btn sm" data-icon="download" data-size="14"> Export saved (CSV)</button></div>
+    </div>
+  </details>
+
+  <details id="statsBox" class="acc">
+    <summary><span data-icon="chart-no-axes-column" data-size="16"></span><b>Call statistics</b><span class="chev" data-icon="chevron-down" data-size="16"></span></summary>
+    <div class="acc-body">
+      <div class="seg" role="group" aria-label="Statistics range" id="statRange">
+        <button data-r="today" aria-pressed="true">Today</button><button data-r="week" aria-pressed="false">7 days</button><button data-r="all" aria-pressed="false">All time</button>
+      </div>
+      <div class="stat-tiles">
+        <div class="stat"><span data-icon="phone" data-size="18"></span><b id="sTotal">0</b><small>Total calls</small></div>
+        <div class="stat good"><span data-icon="circle-check" data-size="18"></span><b id="sPicked">0</b><small>Picked up</small></div>
+        <div class="stat warn"><span data-icon="star" data-size="18"></span><b id="sInt">0</b><small>Interested</small></div>
+        <div class="stat"><span data-icon="calendar-clock" data-size="18"></span><b id="sCb">0</b><small>Callbacks</small></div>
+      </div>
+      <h3 class="sect">By MC block <small class="muted">(<span id="bs">10000</span> MCs per block, new row per pass)</small></h3>
+      <div class="scroll"><table id="stats"></table></div>
+      <p class="small muted">Rates count only calls you marked with a result.</p>
+      <div class="row"><button id="exportStats" class="btn sm" data-icon="download" data-size="14"> Block stats (CSV)</button><button id="export" class="btn sm" data-icon="download" data-size="14"> Call log (CSV)</button></div>
+    </div>
+  </details>
+
+  <details id="settings" class="acc">
+    <summary><span data-icon="settings" data-size="16"></span><b>Settings</b><span class="chev" data-icon="chevron-down" data-size="16"></span></summary>
+    <div class="acc-body">
+
+      <h3 class="sect">Dialing</h3>
+      <label class="switch-row"><span>Auto-dial after hang-up</span><span class="switch"><input id="autoDial2" type="checkbox"><i></i></span></label>
+      <div class="grid2">
+        <div class="field"><label for="delaySec">Delay before next dial</label><select id="delaySec"><option value="3">3 sec</option><option value="5">5 sec</option><option value="8">8 sec</option><option value="10">10 sec</option><option value="15">15 sec</option><option value="20">20 sec</option><option value="30">30 sec</option><option value="60">60 sec</option></select></div>
+        <div class="field"><label for="dailyGoal">Daily call goal</label><input id="dailyGoal" type="number" min="0" inputmode="numeric" placeholder="0 = off"></div>
+      </div>
+      <label class="switch-row"><span>Test mode (load the number, never press Call)</span><span class="switch"><input id="dryRun" type="checkbox"><i></i></span></label>
+
+      <h3 class="sect">Live FMCSA check</h3>
+      <label class="switch-row"><span>Check every carrier live and skip failures</span><span class="switch"><input id="liveCheck" type="checkbox"><i></i></span></label>
+      <div class="field"><label for="webKey">FMCSA webKey</label><div class="inline"><input id="webKey" type="password" autocomplete="off" spellcheck="false"><button class="btn icon-only reveal" data-for="webKey" aria-label="Show or hide key" data-icon="eye"></button></div></div>
+
+      <h3 class="sect">Dispatchio Assist (AI)</h3>
+      <div class="field"><label for="aiMode">Mode</label><select id="aiMode"><option value="off">Off</option><option value="demand">On demand (button)</option><option value="auto">Automatic brief for each carrier</option></select></div>
+      <div class="field"><label for="groqKey">Groq API key (primary)</label><div class="inline"><input id="groqKey" type="password" autocomplete="off" spellcheck="false" placeholder="gsk_..."><button class="btn icon-only reveal" data-for="groqKey" aria-label="Show or hide key" data-icon="eye"></button></div></div>
+      <div class="field"><label for="orKey">OpenRouter API key (fallback)</label><div class="inline"><input id="orKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-or-..."><button class="btn icon-only reveal" data-for="orKey" aria-label="Show or hide key" data-icon="eye"></button></div></div>
+      <details class="sub"><summary>Model overrides (leave blank for automatic)</summary>
+        <div class="field"><label for="groqModel">Groq model</label><input id="groqModel" type="text" autocomplete="off" spellcheck="false" placeholder="auto"></div>
+        <div class="field"><label for="orModel">OpenRouter model</label><input id="orModel" type="text" autocomplete="off" spellcheck="false" placeholder="auto (free models only)"></div>
+      </details>
+      <div class="row"><button id="aiTest" class="btn sm" data-icon="sparkles" data-size="14"> Test AI connection</button></div>
+      <p id="aiTestOut" class="small muted" aria-live="polite"></p>
+      <p class="small muted">When Assist is on, public carrier details (name, location, fleet, owner, cargo) and your notes for summaries are sent to the AI provider you configured. Keys stay on this computer.</p>
+
+      <h3 class="sect">Queue</h3>
+      <div class="field"><label for="blockSize">MC block size for stats</label><input id="blockSize" type="number" min="100" inputmode="numeric"></div>
+      <div class="row"><label class="btn sm"><span data-icon="upload" data-size="14"></span> Load queue.json<input id="file2" type="file" accept=".json" hidden></label></div>
+
+      <h3 class="sect">Appearance</h3>
+      <label class="switch-row"><span>Compact layout</span><span class="switch"><input id="compact" type="checkbox"><i></i></span></label>
+
+      <details class="sub"><summary>Google Voice button matching (advanced)</summary>
+        <p class="small muted">Change only if Google changes the Voice page. Use the Check connection button at the top to see what Dispatchio detects.</p>
+        <div class="field"><label for="endRe">End-call button</label><input id="endRe" type="text" spellcheck="false"></div>
+        <div class="field"><label for="callRe">Call button</label><input id="callRe" type="text" spellcheck="false"></div>
+        <div class="field"><label for="readyRe">Page-ready marker</label><input id="readyRe" type="text" spellcheck="false"></div>
+      </details>
+
+      <h3 class="sect">Data and backup</h3>
+      <p id="storageInfo" class="small muted"></p>
+      <div class="row">
+        <button id="backup" class="btn sm" data-icon="download" data-size="14"> Export backup</button>
+        <label class="btn sm"><span data-icon="upload" data-size="14"></span> Restore backup<input id="restore" type="file" accept=".json" hidden></label>
+        <button id="reset" class="btn sm danger-text" data-icon="trash-2" data-size="14"> Clear call history</button>
+      </div>
+      <p class="small muted">Backups hold your call history, saved carriers, notes and settings, but not your API keys. Clearing history keeps saved carriers and notes.</p>
+    </div>
+  </details>
+
+  <footer class="foot"><span>Dispatchio</span><span id="ver"></span></footer>
+</div>
+<script src="icons.js"></script>
+<script src="ai.js"></script>
+<script src="sidepanel.js"></script>
+</body>
+</html>
