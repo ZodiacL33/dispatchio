@@ -5,7 +5,7 @@ const PHONE_OK = /^[2-9]\d{9}$/;
 const DEF = {
   v: 3, maxFleet: 30, minFleet: 0, blockSize: 10000, dailyGoal: 0, autoDial: false, delaySec: 10,
   dryRun: false, liveCheck: false, webKey: '', compact: false, detectVerified: false,
-  aiMode: 'demand', groqKey: '', orKey: '', groqModel: '', orModel: '',
+  aiMode: 'demand', includeGap: true, groqKey: '', orKey: '', groqModel: '', orModel: '',
   endRe: 'end call|hang up|call_end|^end$|^(un)?mute$',
   callRe: '^(call|start call)$',
   readyRe: 'calls|messages|voicemail',
@@ -18,7 +18,7 @@ const S = { queue: [], map: {}, idx: 0, calls: {}, leads: {}, notes: {}, run: 1,
   cur: null, parked: null, isManual: false, phase: 'empty', gv: 'unknown', paused: false,
   idle: 0, lost: 0, timer: null, dog: null, left: 0, msg: '', kind: 'info', busy: false, polling: false,
   bkey: '', bleft: 0, bdone: 0, shown: '', live: {}, verifying: false, savedTab: 'lead', range: 'today',
-  rowOpen: null, assist: {}, noteSum: {}, briefTimer: null, briefFor: '' };
+  rowOpen: null, assist: {}, noteSum: {}, briefTimer: null, briefFor: '', tab: 'calling', savedAll: false, assistCollapsed: false };
 
 // ---------- helpers ----------
 const fmtPhone = (p) => (p && p.length === 10 ? `+1 (${p.slice(0, 3)}) ${p.slice(3, 6)}-${p.slice(6)}` : p || '');
@@ -57,6 +57,7 @@ function setQueue(q) {
 function eligible(c) {
   if (!c || !c.mc || S.leads[c.mc] || S.calls[`${S.run}:${c.mc}`]) return false;
   if (!PHONE_OK.test(c.phone || '') || !LOWER48.has(c.state)) return false;
+  if (c.units === null || c.units === undefined) return !!c.gap && S.cfg.includeGap !== false;   // brand-new carrier, fleet size verified live
   const u = Number(c.units);
   return Number.isFinite(u) && u >= S.cfg.minFleet && u <= S.cfg.maxFleet;
 }
@@ -144,15 +145,15 @@ async function poll() {
     }
   } catch { /* keep running */ }
   S.polling = false;
-  if (S.cfg.liveCheck && S.cfg.webKey && S.cur && S.phase === 'ready' && !S.live[S.cur.mc]) safe(verifyCurrent)();
+  if (S.cur && S.phase === 'ready' && !S.live[S.cur.mc] && needsLive(S.cur)) safe(verifyCurrent)();
   render();
 }
 
 // ---------- calls ----------
-function setCall(status) {
+function setCall(status, why) {
   const k = ckey();
   const o = S.calls[k] || { mc: S.cur.mc, run: S.run, manual: S.isManual, ts: Date.now() };
-  o.status = status; S.calls[k] = o;
+  o.status = status; if (why) o.why = why; S.calls[k] = o;
 }
 function endCall() {
   if (S.cur && !S.calls[ckey()]) setCall('called');
@@ -187,7 +188,7 @@ async function fmcsa(path, signal) {
 }
 async function liveCheck(c) {
   const done = (o) => ({ ...o, ts: Date.now() });
-  if (!S.cfg.liveCheck) return done({ ok: null, why: 'off' });
+  if (!S.cfg.liveCheck && !c.gap) return done({ ok: null, why: 'off' });
   if (!S.cfg.webKey) return done({ ok: null, why: 'nokey' });
   if (!c.dot) return done({ ok: null, why: 'err' });
   const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 8000);
@@ -196,34 +197,58 @@ async function liveCheck(c) {
     const k = j && j.content && (j.content.carrier || j.content);
     if (!k || typeof k !== 'object' || Array.isArray(k)) return done({ ok: null, why: 'err' });
     const com = k.commonAuthorityStatus, con = k.contractAuthorityStatus;
-    if (com === undefined && con === undefined && k.allowedToOperate === undefined) return done({ ok: null, why: 'err' });
-    if (k.allowedToOperate === 'N') return done({ ok: false, reason: 'FMCSA says it is not allowed to operate' });
-    if (com !== 'A' && con !== 'A') return done({ ok: false, reason: 'its authority is not active' });
-    if (k.brokerAuthorityStatus === 'A') return done({ ok: false, reason: 'it also has broker authority' });
-    let gf = null;
+    const def = (x) => x !== undefined && x !== null && x !== '';
+    const data = { units: def(k.totalPowerUnits) ? Number(k.totalPowerUnits) : NaN, drivers: def(k.totalDrivers) ? Number(k.totalDrivers) : null,
+      city: k.phyCity || '', state: k.phyState || '', country: k.phyCountry || '' };
+    if (!def(com) && !def(con) && !def(k.allowedToOperate)) return done({ ok: null, why: 'shape', data });
+    if (k.allowedToOperate === 'N') return done({ ok: false, reason: 'FMCSA says it is not allowed to operate', data });
+    // skip only on a clear negative: both authority fields present and neither active
+    if (def(com) && def(con) && com !== 'A' && con !== 'A') return done({ ok: false, reason: 'its authority is not active', data });
+    if (k.brokerAuthorityStatus === 'A') return done({ ok: false, reason: 'it also has broker authority', data });
+    let gf = null, cargo = [];
     try {
       const cj = await fmcsa(`carriers/${encodeURIComponent(c.dot)}/cargo-carried`, ctl.signal);
       const txt = JSON.stringify((cj && cj.content) || '');
+      cargo = [...txt.matchAll(/"cargoClassDesc"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
       if (txt.length > 5) gf = /general freight/i.test(txt);
     } catch (e) { if (e.message === 'key') throw e; }
-    if (gf === false) return done({ ok: false, reason: 'live data says General Freight is not ticked' });
-    return done({ ok: true, gf });
+    if (gf === false) return done({ ok: false, reason: 'live data says General Freight is not ticked', data, cargo });
+    return done({ ok: true, gf, data, cargo });
   } catch (e) { return done({ ok: null, why: e.message === 'key' ? 'badkey' : 'err' }); }
   finally { clearTimeout(t); }
 }
+// brand-new carriers (not in the census yet) get their fleet size, drivers and cargo from the live answer
+function applyLive(c, v) {
+  if (!c.gap || c.enriched || !v || !v.data) return;
+  if (Number.isFinite(v.data.units)) { c.units = v.data.units; c.enriched = true; }
+  if (v.data.drivers !== null && Number.isFinite(v.data.drivers)) c.drivers = v.data.drivers;
+  if (v.cargo && v.cargo.length) c.cargo = v.cargo;
+  if (!c.city && v.data.city) c.city = v.data.city;
+  if (v.data.state && v.data.state.length === 2) c.state = v.data.state.toUpperCase();
+}
+function rejectReason(c, v) {
+  if (v && v.ok === false) return v.reason;
+  if (c.gap && c.enriched) {
+    if (!LOWER48.has(c.state)) return `it is based outside the 48 states (${c.state || '?'})`;
+    if (c.units < S.cfg.minFleet || c.units > S.cfg.maxFleet) return `fleet size ${c.units} is outside your ${S.cfg.minFleet}–${S.cfg.maxFleet} range`;
+  }
+  return '';
+}
+const needsLive = (c) => !!S.cfg.webKey && (S.cfg.liveCheck || !!c.gap);
 async function verifyCurrent() {
-  if (S.verifying || !S.cfg.liveCheck || !S.cfg.webKey) return;
+  if (S.verifying || !S.cur || !needsLive(S.cur)) return;
   S.verifying = true;
   try {
-    for (let i = 0; i < 50 && S.cur && S.phase === 'ready'; i++) {
+    for (let i = 0; i < 50 && S.cur && S.phase === 'ready' && needsLive(S.cur); i++) {
       const c = S.cur;
-      if (!S.live[c.mc]) S.live[c.mc] = await liveCheck(c);
+      if (!S.live[c.mc]) { S.live[c.mc] = await liveCheck(c); applyLive(c, S.live[c.mc]); }
       const v = S.live[c.mc];
       if (S.cur !== c) continue;
-      if (v.ok === false && !S.isManual) {
-        if (!S.calls[ckey()]) setCall('skipped');
+      const why = rejectReason(c, v);
+      if (why && !S.isManual) {
+        if (!S.calls[ckey()]) setCall('skipped', 'live: ' + why);
         nextCarrier();
-        say(`Live check skipped ${c.name}: ${v.reason}.`, 'warn');
+        say(`Live check skipped ${c.name}: ${why}.`, 'warn');
         save(); renderStats();
         continue;
       }
@@ -251,17 +276,18 @@ async function dial() {
   if (st !== 'idle') return fail('Cannot read Google Voice yet (still loading, or button names changed). Not dialing.');
   if (!PHONE_OK.test(c.phone)) return fail('This number is not a valid US number. Skipped.');
   if (!S.isManual) {
-    const cached = S.live[c.mc];
-    const v = cached && Date.now() - cached.ts < 600000 ? cached : (S.live[c.mc] = await liveCheck(c));
-    if (v.ok === false) {
-      if (!S.calls[ckey()]) setCall('skipped');
+    let v = S.live[c.mc];
+    if (needsLive(c) && !(v && Date.now() - v.ts < 600000)) { v = S.live[c.mc] = await liveCheck(c); applyLive(c, v); }
+    const why = v ? rejectReason(c, v) : '';
+    if (why) {
+      if (!S.calls[ckey()]) setCall('skipped', 'live: ' + why);
       S.busy = false; nextCarrier();
-      say(`Skipped ${c.name}: live check says ${v.reason}.`, 'warn');
+      say(`Skipped ${c.name}: ${why}.`, 'warn');
       render(); renderStats();
       if (S.cfg.autoDial && !S.paused && S.cur) return go();
       return;
     }
-    if (v.ok === null && S.cfg.liveCheck) say('Live check could not run, so this one was dialed without it.', 'warn');
+    if (v && v.ok === null && (S.cfg.liveCheck || c.gap)) say('Live check could not run, so this one was dialed without it.', 'warn');
   }
   await chrome.storage.local.set({ pendingDial: { number: c.phone, ts: Date.now(), dry: S.cfg.dryRun } });
   S.phase = 'dialing';
@@ -416,11 +442,20 @@ async function refreshStorage() {
 }
 
 // ---------- stats ----------
+function tween(el, to) {
+  const from = Number(el.dataset.v || 0); el.dataset.v = to;
+  const still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (from === to || still || !window.requestAnimationFrame) { el.textContent = num(to); return; }
+  const t0 = performance.now(), d = 480;
+  const step = (t) => { const p = Math.min(1, (t - t0) / d), e = 1 - Math.pow(1 - p, 3); el.textContent = num(Math.round(from + (to - from) * e)); if (p < 1) requestAnimationFrame(step); };
+  requestAnimationFrame(step);
+}
 const PICKED = new Set(['interested', 'callback', 'notinterested', 'dnc']);
 const since = () => { const d = new Date(); if (S.range === 'today') { d.setHours(0, 0, 0, 0); return d.getTime(); } return S.range === 'week' ? Date.now() - 7 * 864e5 : 0; };
 function stats() {
-  const B = {}, t = { total: 0, picked: 0, interested: 0, callback: 0 }, from = since();
+  const B = {}, t = { total: 0, picked: 0, interested: 0, callback: 0, liveSkips: 0 }, from = since();
   for (const l of Object.values(S.calls)) {
+    if (l.status === 'skipped' && l.ts >= from && /^live/.test(l.why || '')) t.liveSkips++;
     if (l.status === 'skipped' || l.ts < from) continue;
     t.total++;
     if (PICKED.has(l.status)) t.picked++;
@@ -441,7 +476,8 @@ const pct = (n, d) => (d ? Math.round((n / d) * 100) + '%' : '-');
 function renderStats() {
   $('bs').textContent = S.cfg.blockSize;
   const { totals: t, rows } = stats();
-  $('sTotal').textContent = num(t.total); $('sPicked').textContent = num(t.picked); $('sInt').textContent = num(t.interested); $('sCb').textContent = num(t.callback);
+  $('liveSkips').textContent = t.liveSkips ? `${num(t.liveSkips)} carrier${t.liveSkips > 1 ? 's' : ''} skipped by the live FMCSA check in this range.` : '';
+  tween($('sTotal'), t.total); tween($('sPicked'), t.picked); tween($('sInt'), t.interested); tween($('sCb'), t.callback);
   const tb = $('stats'); tb.textContent = '';
   const head = tb.insertRow();
   for (const h of ['Block', 'Called', 'Picked up', 'Interested', 'Call back', 'Unmarked']) { const th = document.createElement('th'); th.textContent = h; head.append(th); }
@@ -468,17 +504,18 @@ function renderSaved() {
   ul.textContent = '';
   const items = all.filter(([, l]) => l.type === S.savedTab)
     .sort(([, a], [, b]) => (isDue(b) - isDue(a)) || String(a.followDate || '9').localeCompare(String(b.followDate || '9')) || b.ts - a.ts);
+  const va = $('savedViewAll'); va.hidden = items.length <= 5; va.firstChild.textContent = S.savedAll ? 'Show Less ' : 'View All ';
   if (!items.length) { const li = document.createElement('li'); li.className = 'muted'; li.textContent = 'Nothing saved here yet.'; ul.append(li); return; }
-  for (const [mc, l] of items) {
+  for (const [mc, l] of (S.savedAll ? items : items.slice(0, 5))) {
     const c = l.carrier || { mc }, li = document.createElement('li');
     const r = document.createElement('div'); r.className = 'srow';
-    const ic = document.createElement('span'); ic.className = 'tileic'; ic.dataset.icon = 'building-2'; ic.dataset.size = '16';
+    const ic = document.createElement('span'); ic.className = 'tileic'; ic.dataset.icon = 'building'; ic.dataset.size = '16';
     const who = document.createElement('div'); who.className = 'who';
     const b = document.createElement('b'); b.textContent = c.name || `MC ${mc}`;
     const sp = document.createElement('span'); sp.textContent = `MC ${mc}  •  ${fmtPhone(c.phone)}`;
     who.append(b, sp);
     const bd = document.createElement('span'); bd.className = 'badge ' + l.type; bd.textContent = TYPES[l.type];
-    const kb = document.createElement('button'); kb.className = 'icon-btn sm'; kb.dataset.icon = 'ellipsis-vertical'; kb.dataset.size = '16'; kb.setAttribute('aria-label', 'Actions for ' + (c.name || mc)); kb.setAttribute('aria-expanded', String(S.rowOpen === mc));
+    const kb = document.createElement('button'); kb.className = 'icon-btn sm'; kb.dataset.icon = 'ellipsis'; kb.dataset.size = '16'; kb.setAttribute('aria-label', 'Actions for ' + (c.name || mc)); kb.setAttribute('aria-expanded', String(S.rowOpen === mc));
     kb.onclick = safe(() => { S.rowOpen = S.rowOpen === mc ? null : mc; renderSaved(); });
     r.append(ic, who, bd, kb); li.append(r);
     if (S.rowOpen === mc) {
@@ -487,7 +524,7 @@ function renderSaved() {
       if (S.notes[mc]) { const n = document.createElement('div'); n.className = 'note'; n.textContent = S.notes[mc]; ex.append(n); }
       const row = document.createElement('div'); row.className = 'row';
       const mk = (txt, ic2, cls, fn) => { const bt = document.createElement('button'); bt.className = 'btn sm ' + cls; bt.dataset.icon = ic2; bt.dataset.size = '14'; bt.append(' ' + txt); bt.onclick = safe(fn); return bt; };
-      row.append(mk('Call', 'phone', 'dark', () => openCarrier(c, true)), mk('Open', 'external-link', '', () => openCarrier(c, false)), mk('Remove', 'trash-2', 'danger-text', () => unsave(mc)));
+      row.append(mk('Call', 'phone-solid', 'dark', () => openCarrier(c, true)), mk('Open', 'external', '', () => openCarrier(c, false)), mk('Remove', 'trash', 'danger-text', () => unsave(mc)));
       ex.append(row); li.append(ex);
     }
     ul.append(li);
@@ -503,9 +540,10 @@ function localInsights(c) {
   const lead = S.leads[c.mc];
   if (lead) f.push(`Saved as ${TYPES[lead.type]}${lead.followDate ? `, follow up ${lead.followDate}` : ''}.`);
   if (S.notes[c.mc]) f.push('Your note: ' + (S.notes[c.mc].length > 90 ? S.notes[c.mc].slice(0, 90) + '…' : S.notes[c.mc]));
+  if (c.gap && !c.enriched) f.push('Brand-new carrier, not in the FMCSA census yet. Fleet size and cargo are unconfirmed' + (S.cfg.webKey ? '.' : ', so add your FMCSA key to verify them live.'));
   const units = Number(c.units);
-  if (units === 0) f.push('FMCSA lists 0 trucks. This is often a reporting gap, so ask about their real fleet.');
-  else if (units === 1) f.push('Single-truck operation, likely an owner-operator.');
+  if (c.units !== null && c.units !== undefined && units === 0) f.push('FMCSA lists 0 trucks. This is often a reporting gap, so ask about their real fleet.');
+  else if (c.units !== null && c.units !== undefined && units === 1) f.push('Single-truck operation, likely an owner-operator.');
   const added = Date.parse(c.added), upd = Date.parse(c.mcs150);
   if (!isNaN(added) && Date.now() - added < 365 * 864e5) f.push(`Newer registration (record added ${Math.max(1, Math.round((Date.now() - added) / 2629800000))} months ago).`);
   if (!isNaN(upd) && Date.now() - upd > 730 * 864e5) f.push(`FMCSA record last updated ${Math.floor((Date.now() - upd) / 31557600000)} years ago, so details may be out of date.`);
@@ -551,6 +589,7 @@ function labeled(p, pairs) {
 }
 function renderAssist() {
   const c = S.cur, box = $('assist');
+  box.classList.toggle('collapsed', !!S.assistCollapsed); $('assistToggle').setAttribute('aria-expanded', String(!S.assistCollapsed));
   const mode = S.cfg.aiMode, keys = hasKeys();
   if (!c) { box.hidden = true; return; }
   const facts = localInsights(c), a = S.assist[c.mc], ns = S.noteSum[c.mc];
@@ -558,7 +597,7 @@ function renderAssist() {
   if (!facts.length && !aiOn) { box.hidden = true; return; }
   box.hidden = false;
   const key = facts.join('|'); if (box._k !== key) { box._k = key; const ul = $('assistFacts'); ul.textContent = ''; facts.forEach((t) => { const li = document.createElement('li'); li.textContent = t; ul.append(li); }); }
-  const p = $('assistAI'); p.className = 'assist-ai';
+  const p = $('assistAI'); p.className = 'assist-ai' + ((a && a.status === 'loading') || (!a && mode === 'auto' && keys) ? ' loading' : '');
   if (!aiOn) { p.textContent = ''; }
   else if (!keys) p.textContent = 'Add a Groq or OpenRouter key in Settings to get a brief and a suggested opener.';
   else if (!a) p.textContent = mode === 'auto' ? 'Preparing brief…' : 'Press the refresh button for a quick brief and a suggested opener.';
@@ -593,7 +632,20 @@ function row(dl, k, v, cls) {
   const dt = document.createElement('dt'), dd = document.createElement('dd');
   dt.textContent = k; dd.textContent = v; if (cls) dd.className = cls; dl.append(dt, dd);
 }
-const GV = { nogv: ['Open Google Voice', 'bad'], unknown: ['Voice not readable', 'warn'], idle: ['Google Voice connected', 'ok'], oncall: ['On a call', 'call'] };
+const GV = { nogv: ['Open Google Voice', 'bad'], unknown: ['Voice not readable', 'warn'], idle: ['Google Voice Connected', 'ok'], oncall: ['On a call', 'call'] };
+const VIEWS = ['calling', 'queue', 'saved', 'stats', 'settings'];
+
+function setTab(t) {
+  S.tab = VIEWS.includes(t) ? t : 'calling';
+  VIEWS.forEach((v) => { $('v-' + v).hidden = v !== S.tab; });
+  document.querySelectorAll('#mainTabs button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === S.tab)));
+  const ti = ['calling', 'queue', 'saved', 'stats'].indexOf(S.tab); $('mainTabs').style.setProperty('--ti', Math.max(ti, 0)); $('mainTabs').classList.toggle('noind', ti < 0);
+  $('fleetMenu').hidden = true; $('fleetChip').setAttribute('aria-expanded', 'false');
+  if (S.tab === 'stats') renderStats();
+  if (S.tab === 'saved') renderSaved();
+  if (S.tab === 'settings') refreshStorage();
+  render(); window.scrollTo(0, 0);
+}
 
 function render() {
   // header
@@ -610,19 +662,22 @@ function render() {
   bn.hidden = !S.msg; bn.className = 'banner ' + (S.kind === 'info' ? '' : S.kind);
   if (S.msg) { $('bannerText').textContent = S.msg; setIcon($('bannerIcon'), { ok: 'circle-check', warn: 'triangle-alert', bad: 'circle-alert', info: 'info' }[S.kind] || 'info', 16); }
 
-  // queue card
-  const hasQ = S.queue.length > 0;
+  // queue
+  const hasQ = S.queue.length > 0, z = Number(S.cfg.blockSize) || 10000;
   $('queueCard').hidden = !hasQ;
   $('emptyCard').hidden = !(S.phase === 'empty' || (S.phase === 'done' && !S.cur));
   if (!$('emptyCard').hidden) {
     const dn = S.phase === 'done';
-    $('emptyCard').querySelector('h2').textContent = dn ? 'No more carriers match' : 'No call list loaded';
-    $('emptyCard').querySelector('p').textContent = dn ? 'Change the truck limits, jump to another MC, or load a new queue.' : 'Run build_queue.py, then load the queue.json it creates.';
-    $('emptyCard').querySelector('label.btn').hidden = dn;
+    $('emptyTitle').textContent = dn ? 'No more carriers match' : 'No call list loaded';
+    $('emptyText').textContent = dn ? 'Change the truck limits, jump to another MC, or load a new queue.' : 'Three quick steps and you are calling.';
+    $('steps').hidden = dn;
+    const st = { queue: hasQ, voice: S.gv === 'idle' || S.gv === 'oncall', call: !!S.cfg.detectVerified };
+    document.querySelectorAll('#steps li').forEach((li) => li.classList.toggle('done', !!st[li.dataset.step]));
   }
-  const z = Number(S.cfg.blockSize) || 10000;
-  $('qTitle').textContent = hasQ ? `Queue loaded · ${num(S.queue.length)}` : 'Queue';
-  $('fleetText').textContent = S.cfg.maxFleet >= 9999 ? (S.cfg.minFleet ? `${S.cfg.minFleet}+ trucks` : 'Any fleet size') : `${S.cfg.minFleet}–${S.cfg.maxFleet} trucks`;
+  const fleetTxt = S.cfg.maxFleet >= 9999 ? (S.cfg.minFleet ? `${S.cfg.minFleet}+ Trucks` : 'Any Fleet Size') : `${S.cfg.minFleet}–${S.cfg.maxFleet} Trucks`;
+  $('qTitle').textContent = 'Queue Loaded'; $('fleetText').textContent = fleetTxt;
+  $('qcState').textContent = hasQ ? `Loaded · ${num(S.queue.length)}` : 'No queue';
+  let p = 0;
   if (S.cur) {
     const b = blockOf(S.cur.mc);
     const key = `${S.cur.mc}|${Object.keys(S.calls).length}|${Object.keys(S.leads).length}|${S.cfg.minFleet}|${S.cfg.maxFleet}|${z}|${S.run}`;
@@ -631,12 +686,21 @@ function render() {
       S.bleft = S.queue.filter((c) => blockOf(c.mc) === b && eligible(c)).length;
       S.bdone = Object.values(S.calls).filter((l) => l.run === S.run && !l.manual && blockOf(l.mc) === b).length;
     }
-    const tot = S.bleft + S.bdone, p = tot ? Math.round((S.bdone / tot) * 100) : 0;
-    $('blockText').textContent = `MC Block: ${num(b)} – ${num(b + z - 1)}`; $('passText').textContent = `Pass ${S.run}`;
-    $('leftText').textContent = `${num(S.bleft)} remaining`; $('pctText').textContent = `${p}%`;
-    $('progFill').style.width = p + '%'; $('prog').setAttribute('aria-valuenow', p);
-  } else { $('blockText').textContent = ''; $('passText').textContent = ''; $('leftText').textContent = ''; $('pctText').textContent = ''; $('progFill').style.width = '0'; }
-  document.querySelectorAll('.presets .pill').forEach((p) => p.setAttribute('aria-pressed', String(Number(p.dataset.min) === S.cfg.minFleet && Number(p.dataset.max) === S.cfg.maxFleet)));
+    const tot = S.bleft + S.bdone; p = tot ? Math.round((S.bdone / tot) * 100) : 0;
+    const range = `${num(b)} – ${num(b + z - 1)}`;
+    $('blockText').textContent = `MC Block: ${range}`; $('passText').textContent = '';
+    $('leftText').textContent = `${num(S.bleft)} remaining`; $('qcBlock').textContent = range;
+    $('qcLeft').textContent = `${num(S.bleft)} carriers remaining`; $('qcPct').textContent = `${p}%`;
+    $('fpText').textContent = `${num(S.bdone)} / ${num(tot)}`; $('fpPass').firstChild.textContent = `Pass ${S.run} `;
+  } else { ['blockText', 'passText', 'leftText', 'qcBlock', 'qcLeft', 'qcPct', 'fpText'].forEach((i) => { $(i).textContent = i === 'qcBlock' ? '—' : ''; }); }
+  for (const id of ['progFill', 'qcFill', 'fpFill']) $(id).style.width = p + '%';
+  $('prog').setAttribute('aria-valuenow', p);
+  const showFoot = S.tab === 'calling' && !!S.cur && hasQ;
+  $('footProg').hidden = !showFoot; document.body.classList.toggle('hasfoot', showFoot);
+  document.querySelectorAll('[data-min]').forEach((el) => {
+    const on = Number(el.dataset.min) === S.cfg.minFleet && Number(el.dataset.max) === S.cfg.maxFleet;
+    if (el.classList.contains('pill')) el.setAttribute('aria-pressed', String(on)); else el.setAttribute('aria-checked', String(on));
+  });
   for (const k of ['minFleet', 'maxFleet']) if (document.activeElement !== $(k)) $(k).value = S.cfg[k];
 
   // carrier
@@ -644,18 +708,19 @@ function render() {
   if (S.cur) {
     const c = S.cur, lead = S.leads[c.mc], lv = S.live[c.mc];
     $('name').textContent = (c.name || 'Unknown carrier') + (c.dba ? ` (${c.dba})` : '');
-    $('ids').textContent = `MC ${c.mc}   •   DOT ${c.dot ?? ''}`;
+    $('ids').textContent = `MC ${c.mc}  •  DOT ${c.dot ?? ''}`;
     $('manualTag').hidden = !S.isManual;
     const vc = $('verChip'); let vt = 'Census data', vcl = 'chip', vtt = 'From FMCSA daily files. Turn on the live check in Settings to verify authority before each call.';
-    if (S.cfg.liveCheck && S.cfg.webKey) {
+    if (c.gap && !c.enriched) { vt = S.cfg.webKey ? (lv && lv.ok !== false ? 'Unverified' : 'Checking…') : 'Not in census yet'; vcl = 'chip warn'; vtt = 'Brand-new carrier. Fleet size and cargo are not in FMCSA\'s census yet' + (S.cfg.webKey ? '' : '. Add your FMCSA key in Settings to verify them live.'); }
+    else if (S.cfg.liveCheck && S.cfg.webKey) {
       if (!lv) { vt = 'Checking…'; vtt = 'Asking FMCSA live'; }
       else if (lv.ok === true) { vt = 'Verified'; vcl = 'chip ok'; vtt = 'FMCSA live check: authority active' + (lv.gf ? ', General Freight confirmed' : ''); }
       else if (lv.ok === false) { vt = 'Not authorized'; vcl = 'chip bad'; vtt = lv.reason; }
-      else { vt = lv.why === 'badkey' ? 'Key rejected' : 'Unverified'; vcl = 'chip warn'; vtt = lv.why === 'badkey' ? 'FMCSA rejected the webKey. Check it in Settings.' : 'FMCSA did not answer the live check'; }
+      else { vt = lv.why === 'badkey' ? 'Key rejected' : 'Unverified'; vcl = 'chip warn'; vtt = lv.why === 'badkey' ? 'FMCSA rejected the webKey. Check it in Settings.' : 'FMCSA did not give a clear answer, so this carrier was kept'; }
     }
     vc.className = vcl; vc.title = vtt; $('verText').textContent = vt;
     $('phone').textContent = fmtPhone(c.phone);
-    $('fleet').textContent = `${c.units ?? '?'} Trucks`; $('drivers').textContent = `${c.drivers ?? '—'} Drivers`;
+    $('fleet').textContent = c.units === null || c.units === undefined ? '— Trucks' : `${c.units} Trucks`; $('drivers').textContent = `${c.drivers ?? '—'} Drivers`;
     $('owner').textContent = c.owner || '—'; $('loc').textContent = [c.city, c.state].filter(Boolean).join(', ') || '—'; $('email').textContent = c.email || '—';
     const more = $('more'); more.textContent = '';
     const a = age(c.added), m = age(c.mcs150);
@@ -668,7 +733,8 @@ function render() {
     $('safer').href = `https://safer.fmcsa.dot.gov/query.asp?searchtype=ANY&query_type=queryCarrierSnapshot&query_param=USDOT&query_string=${encodeURIComponent(c.dot ?? '')}`;
     const sk = c.mc + (S.isManual ? 'm' : '');
     if (S.shown !== sk) {                       // reset inputs only when the carrier changes
-      S.shown = sk; $('note').value = S.notes[c.mc] || ''; $('noteCount').textContent = `${($('note').value || '').length} / 500`;
+      S.shown = sk; const cc = $('carrier'); cc.classList.remove('swap'); void cc.offsetWidth; cc.classList.add('swap');
+      $('note').value = S.notes[c.mc] || ''; $('noteCount').textContent = `${($('note').value || '').length} / 500`;
       $('followDate').value = (lead && lead.followDate) || '';
     }
     const tg = $('savedTag'); tg.hidden = !lead; if (lead) tg.textContent = `Saved as ${TYPES[lead.type]}${lead.followDate ? `, follow up ${lead.followDate}` : ''}. Not dialed automatically.`;
@@ -681,11 +747,11 @@ function render() {
 
   // dial area
   const locked = S.phase === 'dialing' || S.phase === 'oncall';
-  $('dial').disabled = !S.cur || locked || S.gv !== 'idle' || S.busy;
-  $('dialText').textContent = S.phase === 'oncall' ? 'On a call' : S.phase === 'dialing' ? 'Calling…' : S.phase === 'wrapup' ? 'Dial next carrier' : 'Dial carrier';
+  $('dial').disabled = !S.cur || locked || S.gv !== 'idle' || S.busy; $('dial').dataset.state = S.phase;
+  $('dialText').textContent = S.phase === 'oncall' ? 'On a Call' : S.phase === 'dialing' ? 'Calling…' : S.phase === 'wrapup' ? 'Dial Next Carrier' : 'Dial Carrier';
   $('skip').disabled = !S.cur || locked; $('skipText').textContent = S.isManual ? ' Close' : ' Skip';
   $('pauseText').textContent = S.paused ? ' Resume' : ' Pause';
-  const pi = $('pause').querySelector(':scope > svg.ic'); if ($('pause').dataset.icon !== (S.paused ? 'play' : 'pause')) setIcon($('pause'), S.paused ? 'play' : 'pause', 16);
+  if ($('pause').dataset.icon !== (S.paused ? 'play' : 'pause')) setIcon($('pause'), S.paused ? 'play' : 'pause', 17);
   let hint = '';
   if (S.phase === 'oncall') hint = 'On a call. The next dial is locked until you hang up.';
   else if (S.phase === 'wrapup' && S.left) hint = `Next call in ${S.left}s. Press Pause to stop it.`;
@@ -694,56 +760,68 @@ function render() {
   else if (S.gv === 'unknown' && !locked) hint = 'Google Voice is open but not readable yet. Tap the status at the top to check.';
   else if (S.phase === 'dialing' && S.cfg.dryRun) hint = 'Test mode: the number is loaded. Press Call yourself.';
   $('dialHint').textContent = hint;
-  $('autoDial').checked = !!S.cfg.autoDial; $('autoDial2').checked = !!S.cfg.autoDial;
+  $('autoDial').checked = !!S.cfg.autoDial; $('autoChip').hidden = !S.cfg.autoDial;
   const an = $('autoNote'); an.hidden = S.cfg.detectVerified; an.textContent = 'Auto-dial unlocks after Dispatchio sees one complete call: dial a carrier and hang up once.';
   document.querySelectorAll('#outcomes button, #saveAs button, #copy, #copyPhone, #unsave').forEach((bn) => { bn.disabled = !S.cur; });
 }
 
 // ---------- settings ----------
 function applyCfg() { document.body.classList.toggle('compact', !!S.cfg.compact); }
+function ensureOption(sel, value, label) { if (![...sel.options].some((o) => Number(o.value) === Number(value))) sel.add(new Option(label, value)); sel.value = value; }
 function fillSettings() {
-  for (const k of ['dailyGoal', 'blockSize', 'webKey', 'groqKey', 'orKey', 'groqModel', 'orModel', 'endRe', 'callRe', 'readyRe']) $(k).value = S.cfg[k] || (k === 'dailyGoal' ? '' : '');
-  const sel = $('delaySec'); if (![...sel.options].some((o) => Number(o.value) === Number(S.cfg.delaySec))) sel.add(new Option(`${S.cfg.delaySec} sec`, S.cfg.delaySec));
-  sel.value = S.cfg.delaySec; $('aiMode').value = S.cfg.aiMode;
+  for (const k of ['blockSize', 'webKey', 'groqKey', 'orKey', 'groqModel', 'orModel', 'endRe', 'callRe', 'readyRe']) $(k).value = S.cfg[k] || '';
+  ensureOption($('delaySec'), S.cfg.delaySec, `${S.cfg.delaySec} sec`);
+  ensureOption($('dailyGoal'), S.cfg.dailyGoal || 0, S.cfg.dailyGoal ? String(S.cfg.dailyGoal) : '0 (disabled)');
+  $('aiMode').value = S.cfg.aiMode;
   for (const k of ['dryRun', 'liveCheck', 'compact']) $(k).checked = !!S.cfg[k];
+  $('includeGap').checked = S.cfg.includeGap !== false;
   $('ver').textContent = 'v' + (chrome.runtime.getManifest ? chrome.runtime.getManifest().version : '');
 }
-function openSection(id) { const d = $(id); d.open = true; d.scrollIntoView({ behavior: 'smooth', block: 'start' }); if (id === 'settings') refreshStorage(); }
 
 function bind() {
   const on = (id, ev, fn) => { $(id)['on' + ev] = safe(fn); };
+  document.querySelectorAll('#mainTabs button').forEach((b) => (b.onclick = safe(() => setTab(b.dataset.tab))));
+  document.querySelectorAll('[data-go]').forEach((b) => (b.onclick = safe(() => setTab(b.dataset.go))));
+  on('btnStats', 'click', () => setTab('stats')); on('btnSettings', 'click', () => setTab('settings')); on('settingsBack', 'click', () => setTab('calling'));
   on('dial', 'click', go); on('skip', 'click', skip); on('pause', 'click', togglePause);
   on('copy', 'click', () => copyText(infoText(S.cur), 'Carrier info copied.')); on('copyPhone', 'click', () => copyText(S.cur.phone, 'Phone number copied.'));
   on('gv', 'click', () => { if ($('diagCard').hidden) diagnose(); else $('diagCard').hidden = true; });
   on('diagRun', 'click', diagnose); on('diagClose', 'click', () => { $('diagCard').hidden = true; });
   on('diagCopy', 'click', () => copyText($('diag').value, 'Connection details copied.'));
   on('bannerClose', 'click', () => { say(''); render(); });
-  on('btnSettings', 'click', () => openSection('settings')); on('btnStats', 'click', () => openSection('statsBox'));
-  on('fleetChip', 'click', () => { const h = $('queueControls').hidden; $('queueControls').hidden = !h; $('fleetChip').setAttribute('aria-expanded', String(h)); });
-  on('jump', 'click', jump); $('jumpMc').onkeydown = (e) => { if (e.key === 'Enter') safe(jump)(); };
-  on('file', 'change', (e) => loadFile(e.target.files[0])); on('file2', 'change', (e) => loadFile(e.target.files[0]));
-  on('restore', 'change', (e) => restore(e.target.files[0]));
-  document.querySelectorAll('.presets .pill').forEach((p) => (p.onclick = safe(() => setFleet(Number(p.dataset.min), Number(p.dataset.max)))));
+  // fleet dropdown on the queue card
+  on('fleetChip', 'click', (e) => { e.stopPropagation(); const h = $('fleetMenu').hidden; $('fleetMenu').hidden = !h; $('fleetChip').setAttribute('aria-expanded', String(h)); });
+  on('fleetCustom', 'click', () => setTab('queue'));
+  document.addEventListener('click', (e) => { if (!$('fleetMenu').hidden && !e.target.closest('.menuwrap')) { $('fleetMenu').hidden = true; $('fleetChip').setAttribute('aria-expanded', 'false'); } });
+  document.querySelectorAll('[data-min]').forEach((el) => (el.onclick = safe(() => { setFleet(Number(el.dataset.min), Number(el.dataset.max)); $('fleetMenu').hidden = true; $('fleetChip').setAttribute('aria-expanded', 'false'); })));
   document.querySelectorAll('[data-step]').forEach((b) => (b.onclick = safe(() => {
     const k = b.dataset.step, v = (Number($(k).value) || 0) + Number(b.dataset.d);
     k === 'minFleet' ? setFleet(Math.max(0, v), NaN) : setFleet(NaN, Math.max(0, v));
   })));
   for (const k of ['minFleet', 'maxFleet']) $(k).onchange = safe((e) => { const v = e.target.value === '' ? NaN : Number(e.target.value); k === 'minFleet' ? setFleet(v, NaN) : setFleet(NaN, v); });
+  on('jump', 'click', jump); $('jumpMc').onkeydown = (e) => { if (e.key === 'Enter') safe(jump)(); };
+  on('file', 'change', (e) => loadFile(e.target.files[0])); on('file2', 'change', (e) => loadFile(e.target.files[0]));
+  on('restore', 'change', (e) => restore(e.target.files[0]));
   document.querySelectorAll('#outcomes button').forEach((b) => (b.onclick = safe(() => outcome(b.dataset.o))));
   document.querySelectorAll('#saveAs button').forEach((b) => (b.onclick = safe(() => saveLead(b.dataset.t))));
   on('unsave', 'click', () => unsave());
   $('note').oninput = (e) => { if (!S.cur) return; const v = e.target.value; if (v) S.notes[S.cur.mc] = v; else delete S.notes[S.cur.mc]; $('noteCount').textContent = `${v.length} / 500`; saveSoon(); };
   on('followDate', 'change', (e) => { const l = S.cur && S.leads[S.cur.mc]; if (l) { l.followDate = e.target.value; save(); renderSaved(); render(); } });
-  on('autoDial', 'change', (e) => setAuto(e.target.checked)); on('autoDial2', 'change', (e) => setAuto(e.target.checked));
-  on('moreToggle', 'click', () => { const h = $('moreBox').hidden; $('moreBox').hidden = !h; $('moreToggle').setAttribute('aria-expanded', String(h)); $('moreText').textContent = h ? 'Hide details' : 'Show more details'; });
+  on('autoDial', 'change', (e) => setAuto(e.target.checked)); on('autoChip', 'click', () => setAuto(false));
+  on('moreToggle', 'click', () => { const h = $('moreBox').hidden; $('moreBox').hidden = !h; $('moreToggle').setAttribute('aria-expanded', String(h)); $('moreText').textContent = h ? 'Hide Details' : 'Show More Details'; });
+  on('moreSettingsBtn', 'click', () => { const h = $('moreSettings').hidden; $('moreSettings').hidden = !h; $('moreSettingsBtn').setAttribute('aria-expanded', String(h)); if (h) refreshStorage(); });
   on('assistGen', 'click', () => genBrief(S.cur)); on('assistNote', 'click', genNote); on('assistUse', 'click', useNoteSummary);
-  document.querySelectorAll('#savedTabs button').forEach((b) => (b.onclick = safe(() => { S.savedTab = b.dataset.f; S.rowOpen = null; renderSaved(); })));
-  document.querySelectorAll('#statRange button').forEach((b) => (b.onclick = safe(() => { S.range = b.dataset.r; document.querySelectorAll('#statRange button').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); renderStats(); })));
+  on('assistToggle', 'click', () => { S.assistCollapsed = !S.assistCollapsed; render(); });
+  document.querySelectorAll('#savedTabs button').forEach((b) => (b.onclick = safe(() => { S.savedTab = b.dataset.f; S.rowOpen = null; S.savedAll = false; renderSaved(); })));
+  on('savedViewAll', 'click', () => { S.savedAll = !S.savedAll; renderSaved(); });
+  const setRange = (r) => { S.range = r; document.querySelectorAll('#statRange button').forEach((x) => x.setAttribute('aria-pressed', String(x.dataset.r === r))); renderStats(); };
+  document.querySelectorAll('#statRange button').forEach((b) => (b.onclick = safe(() => setRange(b.dataset.r))));
+  on('statsViewAll', 'click', () => setRange('all')); on('fpPass', 'click', () => setTab('stats'));
   on('exportSaved', 'click', exportSaved); on('exportStats', 'click', exportStats); on('export', 'click', exportCalls); on('backup', 'click', backup);
-  $('settings').ontoggle = () => { if ($('settings').open) refreshStorage(); };
   document.querySelectorAll('.reveal').forEach((b) => (b.onclick = safe(() => { const i = $(b.dataset.for), show = i.type === 'password'; i.type = show ? 'text' : 'password'; setIcon(b, show ? 'eye-off' : 'eye', 16); })));
   // settings fields
   on('dryRun', 'change', (e) => { S.cfg.dryRun = e.target.checked; save(); });
+  on('includeGap', 'change', (e) => { S.cfg.includeGap = e.target.checked; S.bkey = ''; if ((S.phase === 'ready' && !S.isManual) || S.phase === 'done') { S.parked = null; S.idx = 0; nextCarrier(); } save(); render(); });
   on('compact', 'change', (e) => { S.cfg.compact = e.target.checked; applyCfg(); save(); });
   on('liveCheck', 'change', (e) => {
     S.cfg.liveCheck = e.target.checked; S.live = {};
@@ -759,7 +837,7 @@ function bind() {
     catch (e) { out.textContent = 'Not working: ' + e.message; }
   });
   on('delaySec', 'change', (e) => { S.cfg.delaySec = Math.max(3, Number(e.target.value) || 10); save(); });
-  on('dailyGoal', 'change', (e) => { S.cfg.dailyGoal = Math.max(0, Math.floor(Number(e.target.value)) || 0); fillSettings(); save(); render(); });
+  on('dailyGoal', 'change', (e) => { S.cfg.dailyGoal = Math.max(0, Math.floor(Number(e.target.value)) || 0); save(); render(); });
   on('blockSize', 'change', (e) => { S.cfg.blockSize = Math.max(100, Math.floor(Number(e.target.value)) || 10000); S.bkey = ''; fillSettings(); save(); renderStats(); render(); });
   for (const k of ['endRe', 'callRe', 'readyRe']) on(k, 'change', (e) => {
     try { new RegExp(e.target.value); S.cfg[k] = e.target.value || DEF[k]; } catch { say('That pattern is not valid. Kept the old one.', 'warn'); }
@@ -787,6 +865,6 @@ function bind() {
     const c = d.curMc && S.map[d.curMc];
     if (c && eligible(c)) { S.cur = c; S.phase = 'ready'; } else nextCarrier();
   } else if (Object.keys(S.leads).length) S.phase = 'done';
-  applyCfg(); bind(); fillSettings(); render(); renderStats(); renderSaved();
+  applyCfg(); bind(); fillSettings(); setTab('calling'); renderStats(); renderSaved();
   setInterval(safe(poll), 1000);
 })();

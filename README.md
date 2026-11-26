@@ -1,9 +1,12 @@
-# Dispatchio (v3.0)
+# Dispatchio (v3.2)
 
 ## One-time setup (Windows)
 1. Install Python 3 from python.org (tick "Add Python to PATH").
 2. Put this folder on your Desktop (not in Program Files). Click the folder's address bar, type `cmd`, press Enter.
 3. Build your call list: `python build_queue.py`
+   The downloader now fetches FMCSA's data in pages and checks the row count at the end. An older census.csv or
+   authority.csv from before this version is downloaded again automatically, because the old one-piece download could
+   be cut short, which silently drops the newest carriers. If it stops, run the same command and it resumes.
    The first run downloads two FMCSA files (the census, 1.3 GB, and the authority file) and can take 20 to 40 minutes.
    If the census.csv you already downloaded is in this folder, it is reused and only the authority file downloads.
 4. In Chrome open `chrome://extensions`, turn on Developer mode, click "Load unpacked", pick the `extension` folder.
@@ -51,3 +54,18 @@ unless you add credit), so On demand is the default. Only public carrier facts a
 - API keys are stored on this computer only and are never included in backups. Anyone with access to your Chrome
   profile could read them, so use free-tier keys.
 - Settings > Data and backup: export or restore your history, saved carriers, notes and settings.
+
+## If MC numbers seem to be missing
+1. Run `python build_queue.py --explain 1600000-1609999`. It prints, for every MC in that range, whether it was kept or why it
+   was skipped, with a summary at the top.
+2. Read the lines "Active carrier authorities found in the census" (should be about 100%) and "Dockets in the authority file
+   by MC range" (should rise steadily up to the newest MCs). A low percentage or a range that stops early means a file is incomplete.
+3. The live FMCSA check only skips a carrier on a clear negative answer. Statistics shows how many it skipped.
+
+## Brand-new carriers that are not in the census yet
+FMCSA's census file lags new registrations, so a brand-new carrier can have active authority but no census row. Dispatchio
+no longer drops them. build_queue.py takes their name, address and phone from FMCSA's current authority file, marks them
+"not in census yet", and the panel verifies fleet size, drivers, cargo (General Freight) and authority live through FMCSA's
+service when the carrier comes up (needs your free FMCSA webKey). Carriers that fail your fleet range, state or General
+Freight rule are skipped automatically, and Statistics counts them. Turn the feature off in Queue > "Include brand-new
+carriers". Without a key they still appear, marked "Not in census yet", with fleet size unknown.

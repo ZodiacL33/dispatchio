@@ -10,13 +10,24 @@ file. Contacts, fleet size, cargo and location come from the Company Census File
   python build_queue.py --refresh            download fresh copies first (do this weekly)
   python build_queue.py --insecure           skip the SSL certificate check when downloading
 """
-import argparse, csv, json, os, re, shutil, ssl, subprocess, sys, urllib.request
+import argparse, csv, io, json, os, re, shutil, ssl, subprocess, sys, time, urllib.parse, urllib.request
 from collections import Counter
 
-URL = "https://data.transportation.gov/api/v3/views/{}/export.csv?accessType=DOWNLOAD"
+BASE = os.environ.get("DISPATCHIO_BASE", "https://data.transportation.gov")
+URL = BASE + "/api/v3/views/{}/export.csv?accessType=DOWNLOAD"
 CENSUS_ID, AUTH_ID = "az4n-8mr2", "inys-ebih"
 LOWER48 = set("AL AR AZ CA CO CT DE FL GA IA ID IL IN KS KY LA MA MD ME MI MN MO MS MT "
               "NC ND NE NH NJ NM NV NY OH OK OR PA RI SC SD TN TX UT VA VT WA WI WV WY".split())
+
+_ABBR = "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC".split()
+_NAMES = ["ALABAMA", "ALASKA", "ARIZONA", "ARKANSAS", "CALIFORNIA", "COLORADO", "CONNECTICUT", "DELAWARE", "FLORIDA", "GEORGIA", "HAWAII", "IDAHO", "ILLINOIS", "INDIANA", "IOWA", "KANSAS", "KENTUCKY", "LOUISIANA", "MAINE", "MARYLAND", "MASSACHUSETTS", "MICHIGAN", "MINNESOTA", "MISSISSIPPI", "MISSOURI", "MONTANA", "NEBRASKA", "NEVADA", "NEW HAMPSHIRE", "NEW JERSEY", "NEW MEXICO", "NEW YORK", "NORTH CAROLINA", "NORTH DAKOTA", "OHIO", "OKLAHOMA", "OREGON", "PENNSYLVANIA", "RHODE ISLAND", "SOUTH CAROLINA", "SOUTH DAKOTA", "TENNESSEE", "TEXAS", "UTAH", "VERMONT", "VIRGINIA", "WASHINGTON", "WEST VIRGINIA", "WISCONSIN", "WYOMING", "DISTRICT OF COLUMBIA"]
+STATE_CODE = dict(zip(_NAMES, _ABBR))
+
+
+def norm_state(v):
+    v = (v or "").strip().upper()
+    return STATE_CODE.get(v, v[:2] if len(v) == 2 else v)
+
 
 ALIASES = {
     "dot": ["dot_number", "dotnumber", "usdot_number"],
@@ -99,47 +110,115 @@ def openrd(path):
     return rd, {h.strip().lower(): h for h in rd.fieldnames or []}
 
 
-def download(ds_id, path, insecure, min_big, label):
-    url = URL.format(ds_id)
-    print(f"Downloading {label} (large file, can take 10-25 minutes)...")
-    ctx = None
-    if insecure:
-        ctx = ssl._create_unverified_context()
-        ctx.options |= getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)
-    req = urllib.request.Request(url, headers={"User-Agent": "dispatchio/2.0"})
+_curl = {"on": False}
+
+
+def http_get(url, insecure=False):
+    """GET a URL and return bytes. Falls back to Windows' curl when Python cannot verify the certificate."""
+    if not _curl["on"]:
+        ctx = None
+        if insecure:
+            ctx = ssl._create_unverified_context()
+            ctx.options |= getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)
+        req = urllib.request.Request(url, headers={"User-Agent": "dispatchio/3.1"})
+        try:
+            with urllib.request.urlopen(req, timeout=120, context=ctx) as r:
+                return r.read()
+        except Exception as e:
+            if "CERTIFICATE_VERIFY_FAILED" in str(e) and shutil.which("curl"):
+                _curl["on"] = True
+            else:
+                raise
+    r = subprocess.run(["curl", "-sS", "-L", "--fail", "--ssl-no-revoke", "--max-time", "240", url], capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"curl error {r.returncode}: {r.stderr.decode(errors='replace')[:200]}")
+    return r.stdout
+
+
+def fetch_retry(url, insecure, tries=6):
+    err = None
+    for i in range(tries):
+        try:
+            return http_get(url, insecure)
+        except Exception as e:
+            err = e
+            time.sleep(min(30, 3 * (i + 1)))
+    raise RuntimeError(f"gave up after {tries} tries: {err}")
+
+
+def expected_rows(ds, insecure):
     try:
-        with urllib.request.urlopen(req, timeout=60, context=ctx) as r, open(path, "wb") as f:
-            total, done = int(r.headers.get("Content-Length") or 0), 0
-            while chunk := r.read(1 << 20):
-                f.write(chunk)
-                done += len(chunk)
-                print(f"\r  {done >> 20} MB" + (f" / {total >> 20} MB" if total else ""), end="")
-        print()
-        return
-    except PermissionError:
-        sys.exit("\nWindows will not let this folder be written to. Move the Dispatchio folder to your Desktop or Documents and run again.")
-    except Exception as e:
-        err = str(e)
-    if os.path.exists(path):
-        os.remove(path)
-    if "CERTIFICATE_VERIFY_FAILED" in err and shutil.which("curl"):
-        print("\nPython could not verify the website certificate. Retrying with Windows' own downloader (curl)...")
-        part = path + ".part"
-        rc = subprocess.call(["curl", "-L", "--fail", "--ssl-no-revoke", "-o", part, url])
-        size = os.path.getsize(part) if os.path.exists(part) else 0
-        if (rc == 0 and size > 100_000) or (rc == 56 and size > min_big):
-            with open(part, "rb+") as f:          # cut off any half-written last line
-                f.seek(0, 2); end = f.tell(); f.seek(max(0, end - 1_000_000)); tail = f.read()
-                if not tail.endswith(b"\n"):
-                    f.truncate(end - len(tail) + tail.rfind(b"\n") + 1)
-            os.replace(part, path)
-            print(f"\nDownloaded {size >> 20} MB." + ("" if rc == 0 else " (Windows reported a closing error, the file was kept.)"))
-            return
-        if os.path.exists(part):
-            os.remove(part)
-    sys.exit(f"\nDownload of {label} failed: {err}\n"
-             f"Option 1: in Chrome open https://data.transportation.gov/d/{ds_id}, Export > CSV, save it in this folder as {os.path.basename(path)}.\n"
-             "Option 2: run: python build_queue.py --insecure   (skips the certificate check; the data is public)")
+        t = http_get(f"{BASE}/resource/{ds}.csv?$select=count(*)%20as%20n", insecure).decode()
+        m = re.search(r"(\d+)", t.split("\n", 1)[1] if "\n" in t else t)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def download_paged(ds, path, label, insecure=False, token="", page=50000, order_fallbacks=("dot_number",)):
+    """Downloads a dataset through FMCSA's data API in pages. Resumable, and it checks the row count at the end,
+    so a dropped connection can never silently leave a half-file (the old single-stream download could)."""
+    part, state, marker = path + ".part", path + ".offset", path + ".complete"
+    tok = f"&$$app_token={urllib.parse.quote(token)}" if token else ""
+    order = None
+    for o in (":id",) + tuple(order_fallbacks):
+        try:
+            t = http_get(f"{BASE}/resource/{ds}.csv?$limit=1&$order={urllib.parse.quote(o)}{tok}", insecure)
+            if t[:1] not in (b"{", b"[") and b"\n" in t:
+                order = o
+                break
+        except Exception:
+            continue
+    if order is None:
+        sys.exit(f"Could not start the {label} download (the data service did not answer). Check your internet and try again.")
+    total = expected_rows(ds, insecure)
+    off, mode = 0, "wb"
+    if os.path.exists(part) and os.path.exists(state):
+        off, mode = int(open(state).read().strip() or 0), "ab"
+        print(f"Resuming {label} at row {off:,}")
+    print(f"Downloading {label}" + (f" ({total:,} rows)" if total else "") + " in pages. Safe to stop and re-run; it resumes.")
+    with open(part, mode) as f:
+        while True:
+            url = f"{BASE}/resource/{ds}.csv?$limit={page}&$offset={off}&$order={urllib.parse.quote(order)}{tok}"
+            try:
+                data = fetch_retry(url, insecure)
+            except RuntimeError as e:
+                sys.exit(f"\nDownload stopped: {e}\nRun the same command again and it will continue from row {off:,}.")
+            if data[:1] in (b"{", b"["):
+                sys.exit(f"\nThe data service returned an error: {data[:300].decode(errors='replace')}")
+            text = data.decode("utf-8", "replace")
+            n = sum(1 for _ in csv.reader(io.StringIO(text))) - 1
+            if n <= 0:
+                break
+            body = data if off == 0 else data[data.index(b"\n") + 1:]
+            f.write(body if body.endswith(b"\n") else body + b"\n")
+            f.flush()
+            off += n
+            open(state, "w").write(str(off))
+            print(f"\r  {off:,}" + (f" / {total:,} rows" if total else " rows"), end="", flush=True)
+            if n < page:
+                break
+    print()
+    if total and off < total * 0.995:
+        sys.exit(f"The {label} download ended early ({off:,} of {total:,} rows). Run the command again to continue.")
+    os.replace(part, path)
+    try:
+        os.remove(state)
+    except OSError:
+        pass
+    open(marker, "w").write(str(off))
+    print(f"{label}: {off:,} rows downloaded and verified.")
+
+
+def ensure_file(ds, path, label, args, order_fallbacks):
+    ok = os.path.exists(path) and os.path.exists(path + ".complete")
+    if os.path.exists(path) and not ok and not args.trust_existing:
+        print(f"The existing {path} was not downloaded with the verified method and may be cut short. Downloading it again.")
+    if args.refresh or not ok and not (os.path.exists(path) and args.trust_existing):
+        for x in (path + ".complete",):
+            if os.path.exists(x):
+                os.remove(x)
+        download_paged(ds, path, label, args.insecure, args.app_token, order_fallbacks=order_fallbacks)
 
 
 def top(counter, n=8):
@@ -163,6 +242,20 @@ def load_authority(path):
                  "and send me the authority file's column list.")
     print(f"Authority columns used: docket={docket}, dot={dot}, status={status}, type={typ}, date={datec}"
           + (f", layout B {lay_b}" if layout_b else ""))
+
+    def cands(pat, exclude=""):
+        return [h for l, h in H.items() if re.search(pat, l) and not (exclude and re.search(exclude, l))]
+
+    def best(lst):
+        return sorted(lst, key=lambda h: 0 if re.search(r"bus|phy|physical|business|principal", h.lower()) else 2 if "mail" in h.lower() else 1)[0] if lst else None
+    cn = {"name": best(cands(r"legal.*name") or cands(r"^name$|carrier.*name|company.*name|business.*name|^bus.*name", r"dba")),
+          "dba": best(cands(r"dba")), "phone": best(cands(r"phone|(^|_)tel", r"fax|cell|mail")),
+          "street": best(cands(r"street|addr", r"email|e_mail|city|state|zip")), "city": best(cands(r"city")),
+          "state": best(cands(r"(^|_)(state|st)($|_code)")), "zip": best(cands(r"zip|postal"))}
+    print("Authority contact columns used:", ", ".join(f"{k}={v}" for k, v in cn.items() if v) or "none found")
+    if not cn["phone"]:
+        print("  NOTE: no phone column found in the authority file, so carriers missing from the census cannot be added.")
+    contact = {}
     state, ffdots, stc, tyc, n, bad = {}, set(), Counter(), Counter(), 0, 0
     for row in safe_rows(rd):
         try:
@@ -191,11 +284,15 @@ def load_authority(path):
             cur = state.get((num, kind))
             if cur is None or d >= cur[0]:
                 state[(num, kind)] = (d, act, dt)
+            if kind == "car":
+                cd = contact.get(num)
+                if cd is None or d >= cd[0]:
+                    contact[num] = (d, {k: (row.get(h) or "").strip() for k, h in cn.items() if h})
         except Exception:
             bad += 1
     auth, bdots = {}, set()
     for (num, kind), (_, act, dt) in state.items():
-        rec = auth.setdefault(num, {"dot": dt, "car": False, "br": False})
+        rec = auth.setdefault(num, {"dot": dt, "car": False, "br": False, "c": (contact.get(num) or (None, {}))[1]})
         rec["dot"] = rec["dot"] or dt
         if act:
             rec[kind] = True
@@ -210,12 +307,26 @@ def load_authority(path):
     return auth, bdots, ffdots
 
 
+def gap_lead(num, r, a):
+    """A carrier with active authority that is not in the census yet (the census lags new carriers).
+    Name, address and phone come from the authority file; fleet size, cargo and authority are verified live in the panel."""
+    c = r.get("c") or {}
+    ph, st = norm_phone(c.get("phone")), norm_state(c.get("state"))
+    if not ph or st not in LOWER48:
+        return None
+    return {"gap": True, "dot": r["dot"], "name": c.get("name") or f"MC {num}", "dba": c.get("dba", ""), "phone": ph, "phone2": None,
+            "email": "", "owner": "", "street": c.get("street", ""), "city": c.get("city", "").title(), "state": st, "zip": c.get("zip", ""),
+            "units": None, "drivers": None, "added": "", "mcs150": "", "op": "", "cls": "", "hazmat": False, "cargo": []}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--census", default="census.csv")
     ap.add_argument("--authority", default="authority.csv")
     ap.add_argument("--refresh", action="store_true", help="download fresh copies of both files")
     ap.add_argument("--insecure", action="store_true", help="skip the SSL certificate check when downloading")
+    ap.add_argument("--trust-existing", action="store_true", help="use census.csv/authority.csv as they are, without re-downloading")
+    ap.add_argument("--app-token", default="", help="optional free Socrata app token for faster downloads")
     ap.add_argument("--out", default="queue.json")
     ap.add_argument("--columns", action="store_true")
     ap.add_argument("--explain", default="", help="MC range, e.g. 1290000-1290300")
@@ -226,10 +337,8 @@ def main():
     ap.add_argument("--no-cell-fallback", action="store_true", help="never use the cell phone field")
     a = ap.parse_args()
 
-    if a.refresh or not os.path.exists(a.census):
-        download(CENSUS_ID, a.census, a.insecure, 500_000_000, "the FMCSA census")
-    if a.refresh or not os.path.exists(a.authority):
-        download(AUTH_ID, a.authority, a.insecure, 20_000_000, "the FMCSA authority file")
+    ensure_file(CENSUS_ID, a.census, "the FMCSA census", a, ("dot_number",))
+    ensure_file(AUTH_ID, a.authority, "the FMCSA authority file", a, ("docket_number",))
     if a.columns:
         for p in (a.census, a.authority):
             rd, _ = openrd(p)
@@ -260,10 +369,13 @@ def main():
                  "\nRun with --columns and send me that list so I can map them.")
     cargo_cols = [(h, l[5:]) for l, h in H.items() if l.startswith("crgo_") and "desc" not in l and "othr" not in l]
     g = lambda row, k: (row.get(C[k]) or "").strip() if C[k] else ""
-    verdict, census_status = {}, Counter()
+    verdict, census_status, census_rows, max_dot = {}, Counter(), 0, 0
     for row in safe_rows(rd):
         try:
             dt = dotnorm(g(row, "dot"))
+            census_rows += 1
+            if dt.isdigit() and int(dt) > max_dot:
+                max_dot = int(dt)
             if dt not in cand:
                 continue
             census_status[g(row, "status")] += 1
@@ -305,6 +417,23 @@ def main():
         except Exception:
             continue
 
+    # ---- Coverage checks: this is how a cut-short download or a bad column match shows up ----
+    found = sum(1 for d in cand if d in verdict)
+    cov = found / len(cand) if cand else 0
+    cand_max = max((int(d) for d in cand if d.isdigit()), default=0)
+    print(f"\nCensus rows read: {census_rows:,}   highest USDOT in census: {max_dot:,}   highest USDOT with active carrier authority: {cand_max:,}")
+    print(f"Active carrier authorities found in the census: {found:,} of {len(cand):,} ({cov:.0%})")
+    if cov < 0.9:
+        print("WARNING: many active carriers are missing from the census file. The file is probably incomplete.\n"
+              "         Run: python build_queue.py --refresh     (the new downloader verifies the row count)")
+    buckets, bact = Counter(), Counter()
+    for num, r in auth.items():
+        buckets[int(num) // 100000] += 1
+        bact[int(num) // 100000] += 1 if r["car"] else 0
+    print("\nDockets in the authority file by MC range (should rise steadily up to the newest MCs):")
+    for k in sorted(buckets)[-14:]:
+        print(f"  MC {k*100000:>9,} to {k*100000+99999:>9,}: {buckets[k]:>7,} dockets, {bact[k]:>7,} with active carrier authority")
+
     # ---- Step 3: results per MC ----
     why, leads, trace = Counter(), [], {}
     for num, r in auth.items():
@@ -314,11 +443,11 @@ def main():
         elif not r["dot"] or r["dot"] not in cand:
             res = "skipped: no USDOT on record"
         elif r["dot"] not in verdict:
-            res = "skipped: not in the census file"
+            res = gap_lead(num, r, a) or "skipped: not in the census, and no usable phone or state in the authority file"
         else:
             res = verdict[r["dot"]]
         if isinstance(res, dict):
-            why["KEPT"] += 1
+            why["KEPT (not in census yet, verified live in the panel)" if res.get("gap") else "KEPT"] += 1
             if n_int >= a.start_mc:
                 leads.append({"mc": num, **res})
             trace[n_int] = "KEPT: " + res["name"]
@@ -338,6 +467,13 @@ def main():
     if leads:
         print(f"MC range: {leads[0]['mc']} to {leads[-1]['mc']}")
     if lo is not None:
+        cnt = Counter()
+        for n in range(lo, hi + 1):
+            r = trace.get(n, "not in the FMCSA authority file")
+            cnt["KEPT" if r.startswith("KEPT") else re.sub(r" \(.*\)$", "", r)] += 1
+        print(f"\n--- Summary for MC {lo} to {hi} ({hi - lo + 1:,} numbers) ---")
+        for k, v in sorted(cnt.items(), key=lambda kv: -kv[1]):
+            print(f"{v:>8,}  {k}")
         print(f"\n--- MC {lo} to {hi} ---")
         shown = 0
         for n in range(lo, hi + 1):
